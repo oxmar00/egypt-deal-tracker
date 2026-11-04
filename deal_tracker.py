@@ -52,11 +52,12 @@ MIN_RATING = float(os.getenv("MIN_RATING", "3.8"))
 RE_ALERT_DROP_PCT = float(os.getenv("RE_ALERT_DROP_PCT", "5.0"))  # Re-notify if price drops another 5%
 MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "15"))
 
-# High-Frequency 4-Minute Loop Settings
-LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "240"))  # 4 minutes (240s)
-JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", "25"))                 # Random +/- 25s human jitter
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "52"))       # Run for 52m per hourly GitHub job
-URLS_PER_PLATFORM_CYCLE = int(os.getenv("URLS_PER_PLATFORM_CYCLE", "2"))  # Stagger URLs per 4-min cycle
+# High-Frequency 1-Minute Loop Settings
+LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "60"))   # 1 minute between cycle starts
+JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", "10"))                 # Random +/- 10s human jitter
+MIN_CYCLE_GAP_SECONDS = float(os.getenv("MIN_CYCLE_GAP_SECONDS", "5"))  # Always pause at least this long
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "50"))       # Run for 50m per GitHub job
+URLS_PER_PLATFORM_CYCLE = int(os.getenv("URLS_PER_PLATFORM_CYCLE", "2"))  # Stagger URLs per cycle
 
 # Anti-Block Proxy Pool (comma-separated list of http/socks5 proxies)
 # Example: http://user:pass@gate.smartproxy.com:7000,http://user:pass@proxy2.com:8080
@@ -1036,10 +1037,10 @@ async def run_tracker(loop_mode: bool = False) -> None:
                 )
                 break
 
-            # Calculate sleep time to hit 4-minute target + anti-bot jitter
+            # Calculate sleep time to hit the loop interval target + anti-bot jitter
             cycle_duration = time.monotonic() - cycle_start
             jitter = random.randint(-JITTER_SECONDS, JITTER_SECONDS)
-            target_wait = max(30.0, (LOOP_INTERVAL_SECONDS + jitter) - cycle_duration)
+            target_wait = max(MIN_CYCLE_GAP_SECONDS, (LOOP_INTERVAL_SECONDS + jitter) - cycle_duration)
 
             # If a CAPTCHA or WAF challenge occurred without a proxy pool, apply extra cooldown
             if was_blocked and not PROXY_POOL:
@@ -1047,7 +1048,7 @@ async def run_tracker(loop_mode: bool = False) -> None:
                 logger.warning(f"Applying {backoff}s anti-block cooldown before next cycle...")
                 target_wait += backoff
 
-            logger.info(f"Sleeping {target_wait:.1f}s until next 4-minute scan cycle...")
+            logger.info(f"Cycle took {cycle_duration:.1f}s; sleeping {target_wait:.1f}s until next scan cycle...")
             await asyncio.sleep(target_wait)
 
         await browser.close()

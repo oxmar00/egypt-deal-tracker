@@ -2,17 +2,18 @@ name: Egypt Deal Tracker
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour; the script loops for ~52 minutes per run
+    - cron: "0 * * * *"   # hourly watchdog; loop runs normally chain into each other (see last step)
   workflow_dispatch:
     inputs:
       mode:
-        description: "loop = 52-minute scan loop, once = single cycle, self-test = offline test"
+        description: "loop = 50-minute scan loop (1 scan/minute), once = single cycle, self-test = offline test"
         type: choice
         options: [loop, once, self-test]
         default: once
 
 permissions:
   contents: write   # needed to commit deals_history.db back to the repo
+  actions: write    # needed for a loop run to start the next one
 
 concurrency:
   group: deal-tracker
@@ -34,6 +35,9 @@ jobs:
       MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '15' }}
       DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
       AMAZON_SOLD_BY_AMAZON_ONLY: ${{ vars.AMAZON_SOLD_BY_AMAZON_ONLY || 'true' }}
+      LOOP_INTERVAL_SECONDS: ${{ vars.LOOP_INTERVAL_SECONDS || '60' }}
+      JITTER_SECONDS: ${{ vars.JITTER_SECONDS || '10' }}
+      MAX_RUNTIME_MINUTES: ${{ vars.MAX_RUNTIME_MINUTES || '50' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -74,3 +78,11 @@ jobs:
           git commit -m "Update deal price history [skip ci]"
           git pull --rebase -X theirs || true
           git push
+
+      # Keep scanning near-continuously: a finished loop run queues the next one.
+      # Stops if the run failed (the hourly schedule retries) or when CHAIN_RUNS=false.
+      - name: Start next loop run
+        if: ${{ success() && (github.event_name == 'schedule' || github.event.inputs.mode == 'loop') && vars.CHAIN_RUNS != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deal-tracker.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f mode=loop
