@@ -91,24 +91,36 @@ def build_amazon_deal_url(department: str, node: str = "") -> str:
 
 # Target URLs for Egypt Deals: Electronics, Women's & Men's Fashion, Supermarket, Automotive, Health
 # (department aliases from amazon.eg's search dropdown; fashion nodes from its Department refinement)
-AMAZON_EG_DEAL_URLS = [
-    build_amazon_deal_url("electronics"),
-    build_amazon_deal_url("fashion", "21845145031"),  # Women
-    build_amazon_deal_url("fashion", "21845147031"),  # Men
-    build_amazon_deal_url("grocery"),
-    build_amazon_deal_url("automotive"),
-    build_amazon_deal_url("hpc"),                     # Health, Household & Baby Care
+AMAZON_EG_CATEGORY_URLS: List[Tuple[str, str]] = [
+    ("Electronics", build_amazon_deal_url("electronics")),
+    ("Women's Fashion", build_amazon_deal_url("fashion", "21845145031")),
+    ("Men's Fashion", build_amazon_deal_url("fashion", "21845147031")),
+    ("Supermarket", build_amazon_deal_url("grocery")),
+    ("Automotive", build_amazon_deal_url("automotive")),
+    ("Health & Nutrition", build_amazon_deal_url("hpc")),  # Health, Household & Baby Care
 ]
 
 # Same categories on Noon; each uses whichever deal tag (mega-deal / deals-generic) lists the most 20%+ offers
-NOON_EG_DEAL_URLS = [
-    "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/fashion/eg-fashion-women-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/fashion/eg-fashion-men-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/grocery-store/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/automotive/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/health/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
+NOON_EG_CATEGORY_URLS: List[Tuple[str, str]] = [
+    ("Electronics", "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc"),
+    ("Women's Fashion", "https://www.noon.com/egypt-en/fashion/eg-fashion-women-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc"),
+    ("Men's Fashion", "https://www.noon.com/egypt-en/fashion/eg-fashion-men-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc"),
+    ("Supermarket", "https://www.noon.com/egypt-en/grocery-store/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc"),
+    ("Automotive", "https://www.noon.com/egypt-en/automotive/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc"),
+    ("Health & Nutrition", "https://www.noon.com/egypt-en/health/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc"),
 ]
+
+AMAZON_EG_DEAL_URLS = [url for _, url in AMAZON_EG_CATEGORY_URLS]
+NOON_EG_DEAL_URLS = [url for _, url in NOON_EG_CATEGORY_URLS]
+CATEGORY_BY_URL: Dict[str, str] = {url: cat for cat, url in AMAZON_EG_CATEGORY_URLS + NOON_EG_CATEGORY_URLS}
+
+
+def tag_new_deals_with_category(deals: Dict[str, "DealItem"], url: str) -> None:
+    """Labels deals found on the page just scanned with that page's category."""
+    category = CATEGORY_BY_URL.get(url)
+    for deal in deals.values():
+        if deal.category is None:
+            deal.category = category
 
 
 # ==============================================================================
@@ -303,6 +315,7 @@ class DealItem:
     rating: Optional[float] = None
     review_count: Optional[int] = None
     is_historical_low: bool = False
+    category: Optional[str] = None  # e.g. "Electronics", from the page it was found on
 
 
 # ==============================================================================
@@ -624,6 +637,8 @@ async def scrape_amazon_egypt(context: BrowserContext, urls_to_scan: List[str]) 
         except Exception as exc:
             logger.warning(f"[Amazon.eg] Error scraping {url}: {exc}")
 
+        tag_new_deals_with_category(deals, url)
+
     await page.close()
     logger.info(f"[Amazon.eg] Found {len(deals)} qualifying deals.")
     return list(deals.values()), was_blocked
@@ -854,6 +869,8 @@ async def scrape_noon_egypt(context: BrowserContext, urls_to_scan: List[str]) ->
         except Exception as exc:
             logger.warning(f"[Noon Egypt] Error scraping {url}: {exc}")
 
+        tag_new_deals_with_category(deals, url)
+
     await page.close()
     logger.info(f"[Noon Egypt] Found {len(deals)} qualifying deals.")
     return list(deals.values()), was_blocked
@@ -881,6 +898,12 @@ def format_telegram_caption(deal: DealItem) -> str:
     lines = [
         f"{platform_icon} <b>{deal.platform} Hot Offer</b>",
         f"{badge_line}",
+    ]
+    if deal.category:
+        # Hashtag lets you tap it in Telegram to see every alert from that category
+        hashtag = "#" + re.sub(r"[^A-Za-z0-9]", "", deal.category)
+        lines.append(f"🏷 <b>Category:</b> {deal.category.replace('&', '&amp;')} {hashtag}")
+    lines += [
         "",
         f"📦 <b>{safe_title}</b>",
         "",
@@ -1111,6 +1134,12 @@ def run_self_test() -> None:
       <div data-qa="plp-product-box-price"><div><span>EGP</span><strong>7,888</strong></div></div>
     </a>
     """
+    # Verify every scanned page has a category and captions show it
+    assert all(u in CATEGORY_BY_URL for u in AMAZON_EG_DEAL_URLS + NOON_EG_DEAL_URLS), "URL without category"
+    tagged = {"x": DealItem("NOON-X", "Noon Egypt", "Vitamin C", 80.0, 100.0, 20.0, "https://www.noon.com/")}
+    tag_new_deals_with_category(tagged, NOON_EG_DEAL_URLS[-1])
+    assert "Health &amp; Nutrition #HealthNutrition" in format_telegram_caption(tagged["x"]), "Category missing from caption"
+
     noon_deals = parse_noon_product_boxes(BeautifulSoup(noon_html, "lxml"))
     assert len(noon_deals) == 1, f"Noon parser expected 1 discounted card, got {len(noon_deals)}"
     nd = noon_deals[0]
