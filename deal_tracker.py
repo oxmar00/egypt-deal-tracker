@@ -76,24 +76,37 @@ AMAZON_SOLD_BY_AMAZON_ONLY = os.getenv("AMAZON_SOLD_BY_AMAZON_ONLY", "true").low
 AMAZON_EG_SELLER_ID = "A1ZVRGNO5AYLOV"  # "Amazon.eg" in the search page's Seller (p_6) filter
 
 
-def build_amazon_deal_url(department: str) -> str:
-    """Today's Deals search URL for a department ("" = all), optionally limited to Amazon.eg as seller."""
-    rh = "p_n_deal_type:26901043031"
+AMAZON_ALL_DISCOUNTS = "26901036031"  # "Deals & Discounts > All Discounts" (p_n_deal_type)
+
+
+def build_amazon_deal_url(department: str, node: str = "") -> str:
+    """Discounted-items search URL for a department (and optional sub-category node), optionally Amazon.eg-sold only."""
+    rh = (f"n:{node}," if node else "") + f"p_n_deal_type:{AMAZON_ALL_DISCOUNTS}"
     if AMAZON_SOLD_BY_AMAZON_ONLY:
         rh += f",p_6:{AMAZON_EG_SELLER_ID}"
-    params = {"i": department} if department else {}
-    params.update({"rh": rh, "s": "featured-rank"})
+    params = {"i": department, "rh": rh, "s": "featured-rank"}
     return "https://www.amazon.eg/-/en/s?" + urllib.parse.urlencode(params)
 
 
-# Target URLs for Egypt Deals (department aliases from amazon.eg's search dropdown)
-AMAZON_EG_DEAL_URLS = [build_amazon_deal_url(d) for d in ("", "electronics", "home", "garden")]
+# Target URLs for Egypt Deals: Electronics, Women's & Men's Fashion, Supermarket, Automotive, Health
+# (department aliases from amazon.eg's search dropdown; fashion nodes from its Department refinement)
+AMAZON_EG_DEAL_URLS = [
+    build_amazon_deal_url("electronics"),
+    build_amazon_deal_url("fashion", "21845145031"),  # Women
+    build_amazon_deal_url("fashion", "21845147031"),  # Men
+    build_amazon_deal_url("grocery"),
+    build_amazon_deal_url("automotive"),
+    build_amazon_deal_url("hpc"),                     # Health, Household & Baby Care
+]
 
+# Same categories on Noon; each uses whichever deal tag (mega-deal / deals-generic) lists the most 20%+ offers
 NOON_EG_DEAL_URLS = [
-    "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&f[is_fbn]=1&sort[by]=popularity&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/electronics-and-mobiles/mobiles-and-accessories/mobiles-20905/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/home-and-kitchen/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
-    "https://www.noon.com/egypt-en/electronics-and-mobiles/computers-and-accessories/laptops/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/fashion/eg-fashion-women-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/fashion/eg-fashion-men-cat/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/grocery-store/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/automotive/?f[deal_tag][]=deals-generic&sort[by]=popularity&sort[dir]=desc",
+    "https://www.noon.com/egypt-en/health/?f[deal_tag][]=mega-deal&sort[by]=popularity&sort[dir]=desc",
 ]
 
 
