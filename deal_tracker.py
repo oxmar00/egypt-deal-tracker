@@ -80,7 +80,7 @@ AMAZON_EG_DEAL_URLS = [
 ]
 
 NOON_EG_DEAL_URLS = [
-    "https://www.noon.com/egypt-en/eg-mahally-deals/",
+    "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&f[is_fbn]=1&sort[by]=popularity&sort[dir]=desc",
     "https://www.noon.com/egypt-en/electronics-and-mobiles/mobiles-and-accessories/mobiles-20905/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
     "https://www.noon.com/egypt-en/home-and-kitchen/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
     "https://www.noon.com/egypt-en/electronics-and-mobiles/computers-and-accessories/laptops/?f[is_fbn]=1&sort[by]=discount&sort[dir]=desc",
@@ -605,6 +605,63 @@ async def scrape_amazon_egypt(context: BrowserContext, urls_to_scan: List[str]) 
     return list(deals.values()), was_blocked
 
 
+def parse_noon_product_boxes(soup: BeautifulSoup) -> List[DealItem]:
+    """
+    Parses Noon PLP product cards. Each card is an <a href=".../<SKU>/p/"> holding
+    data-qa="plp-product-box-name" and data-qa="plp-product-box-price"; the price box
+    shows "EGP <sale>" in <strong> and the old price in .strikeThrough (no "EGP" prefix).
+    """
+    results: List[DealItem] = []
+    for a_tag in soup.select("a[href*='/p/']"):
+        price_box = a_tag.select_one("[data-qa='plp-product-box-price']")
+        if not price_box:
+            continue
+        href = a_tag.get("href", "")
+        m_sku = re.search(r"/([A-Z0-9]+(?:\-[A-Z0-9]+)?)/p/", href, re.I)
+        if not m_sku:
+            continue
+        sku = m_sku.group(1).upper()
+
+        curr_el = price_box.select_one("strong")
+        orig_el = price_box.select_one(".strikeThrough")
+        curr = parse_egp_price(curr_el.get_text() if curr_el else None)
+        orig = parse_egp_price(orig_el.get_text() if orig_el else None)
+        if not curr or not orig or orig <= curr:
+            continue
+
+        name_el = a_tag.select_one("[data-qa='plp-product-box-name']")
+        title = ((name_el.get("title") or name_el.get_text(strip=True)) if name_el else "").strip()
+        if not title:
+            continue
+
+        rating = None
+        rating_el = a_tag.select_one("[class*='_textCtr_']")
+        if rating_el:
+            try:
+                rating = float(rating_el.get_text(strip=True))
+            except ValueError:
+                rating = None
+
+        # The first <img> in a card is a placeholder SVG; the real one is the product image
+        img_el = a_tag.select_one("img[class*='productImage']")
+        disc = round(((orig - curr) / orig) * 100.0, 1)
+        full_url = urllib.parse.urljoin("https://www.noon.com", href.split("?")[0])
+
+        results.append(DealItem(
+            product_id=f"NOON-{sku}",
+            platform="Noon Egypt",
+            title=title[:180],
+            current_price=curr,
+            original_price=orig,
+            discount_pct=disc,
+            url=build_affiliate_url(full_url, "Noon Egypt"),
+            image_url=img_el.get("src") if img_el else None,
+            is_express_or_fba=bool(a_tag.select_one("[data-qa='product-noon-express']")),
+            rating=rating,
+        ))
+    return results
+
+
 async def scrape_noon_egypt(context: BrowserContext, urls_to_scan: List[str]) -> Tuple[List[DealItem], bool]:
     deals: Dict[str, DealItem] = {}
     was_blocked = False
@@ -709,38 +766,10 @@ async def scrape_noon_egypt(context: BrowserContext, urls_to_scan: List[str]) ->
                 except Exception:
                     pass
 
-            # Product anchor cards fallback
-            for a_tag in soup.select("a[href*='/p/'], a[id^='productBox-']"):
-                href = a_tag.get("href", "")
-                m_sku = re.search(r"/([A-Z0-9]+(?:\-[A-Z0-9]+)?)/p/", href, re.I)
-                if not m_sku:
-                    continue
-                sku = m_sku.group(1).upper()
-                card_text = a_tag.get_text(" ", strip=True)
-                img_el = a_tag.select_one("img")
-                title = (img_el.get("alt") if img_el and img_el.get("alt") else a_tag.get("title") or card_text)[:180]
-
-                nums = re.findall(r"EGP\s*([\d,]+(?:\.\d+)?)", card_text)
-                if len(nums) >= 2:
-                    curr = parse_egp_price(nums[0])
-                    orig = parse_egp_price(nums[1])
-                    if curr and orig and orig > curr:
-                        disc = round(((orig - curr) / orig) * 100.0, 1)
-                        full_url = urllib.parse.urljoin("https://www.noon.com", href)
-                        full_url = build_affiliate_url(full_url, "Noon Egypt")
-                        deal = DealItem(
-                            product_id=f"NOON-{sku}",
-                            platform="Noon Egypt",
-                            title=title,
-                            current_price=curr,
-                            original_price=orig,
-                            discount_pct=disc,
-                            url=full_url,
-                            image_url=img_el.get("src") if img_el else None,
-                            is_express_or_fba="express" in card_text.lower(),
-                        )
-                        if passes_filters(deal):
-                            deals[deal.product_id] = deal
+            # Product box cards (PLP layout)
+            for deal in parse_noon_product_boxes(soup):
+                if passes_filters(deal):
+                    deals[deal.product_id] = deal
 
             await page.wait_for_timeout(random.randint(2500, 5200))
 
@@ -962,6 +991,33 @@ def run_self_test() -> None:
     c0 = select_cycle_urls(AMAZON_EG_DEAL_URLS, 0, 2)
     c1 = select_cycle_urls(AMAZON_EG_DEAL_URLS, 1, 2)
     assert len(c0) == 2 and len(c1) == 2 and c0 != c1, "URL sharding rotation failed"
+
+    # Verify Noon PLP product box parsing (markup captured from noon.com/egypt-en, Nov 2026)
+    noon_html = """
+    <a href="/egypt-en/galaxy-a36-5g-dual-sim-awesome-white-8gb-ram-256gb/N70158921V/p/?o=e8faa407200c3bec">
+      <img class="_placeholderContainer_a0aok_7" src="https://f.nooncdn.com/s/app/com/noon/images/media-placeholder.svg" alt="placeholder">
+      <img class="_productImage_1yztz_82" src="https://f.nooncdn.com/p/pzsku/Z1/45/_/1/a.jpg?width=800" alt="Galaxy - Image 1">
+      <h2 data-qa="plp-product-box-name" title="Samsung Galaxy A36 5G Dual SIM Awesome White 8GB RAM 256GB">Samsung Galaxy A36 5G</h2>
+      <div class="_textCtr_6uyte_16">4.4</div>
+      <div data-qa="plp-product-box-price">
+        <div><span>EGP</span><strong class="_amount_a2gq6_61">23,999</strong></div>
+        <div><span class="_oldPrice_a2gq6_87 strikeThrough">27,999</span><span>14% Off</span></div>
+      </div>
+      <div data-qa="product-noon-express"></div>
+    </a>
+    <a href="/egypt-en/a200-plus-dual-sim-nightly-blue/N70377906V/p/">
+      <h2 data-qa="plp-product-box-name" title="ITEL A200 Plus">ITEL A200 Plus</h2>
+      <div data-qa="plp-product-box-price"><div><span>EGP</span><strong>7,888</strong></div></div>
+    </a>
+    """
+    noon_deals = parse_noon_product_boxes(BeautifulSoup(noon_html, "lxml"))
+    assert len(noon_deals) == 1, f"Noon parser expected 1 discounted card, got {len(noon_deals)}"
+    nd = noon_deals[0]
+    assert nd.product_id == "NOON-N70158921V", nd.product_id
+    assert (nd.current_price, nd.original_price, nd.rating) == (23999.0, 27999.0, 4.4), nd
+    assert nd.title.startswith("Samsung Galaxy A36") and nd.is_express_or_fba, nd
+    assert nd.image_url and "placeholder" not in nd.image_url, nd.image_url
+    assert nd.url == "https://www.noon.com/egypt-en/galaxy-a36-5g-dual-sim-awesome-white-8gb-ram-256gb/N70158921V/p/", nd.url
 
     sample_deals = [
         DealItem(
