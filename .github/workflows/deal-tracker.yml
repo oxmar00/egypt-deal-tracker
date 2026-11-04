@@ -33,6 +33,7 @@ jobs:
       MIN_RATING: ${{ vars.MIN_RATING || '3.8' }}
       MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '15' }}
       DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+      AMAZON_SOLD_BY_AMAZON_ONLY: ${{ vars.AMAZON_SOLD_BY_AMAZON_ONLY || 'true' }}
 
     steps:
       - uses: actions/checkout@v5

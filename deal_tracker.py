@@ -71,13 +71,23 @@ NOON_AFFILIATE_CODE = os.getenv("NOON_AFFILIATE_CODE", "").strip()
 DB_PATH = os.getenv("DEALS_DB_PATH", "deals_history.db")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 
-# Target URLs for Egypt Deals
-AMAZON_EG_DEAL_URLS = [
-    "https://www.amazon.eg/-/en/gp/goldbox",
-    "https://www.amazon.eg/-/en/s?i=electronics&rh=p_n_deal_type%3A26901043031&s=featured-rank",
-    "https://www.amazon.eg/-/en/s?i=kitchen&rh=p_n_deal_type%3A26901043031&s=featured-rank",
-    "https://www.amazon.eg/-/en/s?i=computers&rh=p_n_deal_type%3A26901043031&s=featured-rank",
-]
+# Only alert on Amazon offers shipped & sold by Amazon.eg (not third-party sellers)
+AMAZON_SOLD_BY_AMAZON_ONLY = os.getenv("AMAZON_SOLD_BY_AMAZON_ONLY", "true").lower() in ("1", "true", "yes")
+AMAZON_EG_SELLER_ID = "A1ZVRGNO5AYLOV"  # "Amazon.eg" in the search page's Seller (p_6) filter
+
+
+def build_amazon_deal_url(department: str) -> str:
+    """Today's Deals search URL for a department ("" = all), optionally limited to Amazon.eg as seller."""
+    rh = "p_n_deal_type:26901043031"
+    if AMAZON_SOLD_BY_AMAZON_ONLY:
+        rh += f",p_6:{AMAZON_EG_SELLER_ID}"
+    params = {"i": department} if department else {}
+    params.update({"rh": rh, "s": "featured-rank"})
+    return "https://www.amazon.eg/-/en/s?" + urllib.parse.urlencode(params)
+
+
+# Target URLs for Egypt Deals (department aliases from amazon.eg's search dropdown)
+AMAZON_EG_DEAL_URLS = [build_amazon_deal_url(d) for d in ("", "electronics", "home", "garden")]
 
 NOON_EG_DEAL_URLS = [
     "https://www.noon.com/egypt-en/electronics-and-mobiles/?f[deal_tag][]=mega-deal&f[is_fbn]=1&sort[by]=popularity&sort[dir]=desc",
@@ -605,6 +615,60 @@ async def scrape_amazon_egypt(context: BrowserContext, urls_to_scan: List[str]) 
     return list(deals.values()), was_blocked
 
 
+def amazon_buybox_sold_by_amazon(html: str) -> Optional[bool]:
+    """
+    Reads the product page buy box. Amazon-sold offers show a single "Shipper / Seller: Amazon.eg"
+    row; third-party offers show "Sold by: <shop>" (often with "Fulfilled by: Amazon").
+    Returns True/False, or None if the seller row is missing (e.g. out of stock or layout change).
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    def feature_text(name: str) -> Optional[str]:
+        el = soup.select_one(f"[offer-display-feature-name='{name}'] .offer-display-feature-text-message")
+        return el.get_text(strip=True) if el else None
+
+    seller = feature_text("desktop-merchant-info")
+    if seller is None:
+        return None
+    shipper = feature_text("desktop-fulfiller-info")
+    return seller.lower() == "amazon.eg" and (shipper is None or shipper.lower().startswith("amazon"))
+
+
+# ASIN -> sold-by-Amazon.eg verdict, cached for the lifetime of one run
+AMAZON_SELLER_CACHE: Dict[str, bool] = {}
+
+
+async def verify_amazon_seller(context: BrowserContext, deal: DealItem) -> bool:
+    """Opens the product page and confirms the buy box offer is shipped & sold by Amazon.eg."""
+    asin = deal.product_id.removeprefix("AMZ-")
+    if asin in AMAZON_SELLER_CACHE:
+        return AMAZON_SELLER_CACHE[asin]
+
+    page = await context.new_page()
+    try:
+        await page.goto(f"https://www.amazon.eg/-/en/dp/{asin}", wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(random.randint(1200, 2600))
+        html = await page.content()
+    except Exception as exc:
+        logger.warning(f"[Amazon.eg] Could not open {asin} to check seller: {exc}")
+        return False
+    finally:
+        await page.close()
+
+    if is_bot_challenged(html, "Amazon Egypt"):
+        logger.warning(f"[Amazon.eg] CAPTCHA while checking seller for {asin}; skipping this cycle.")
+        return False
+
+    verdict = amazon_buybox_sold_by_amazon(html)
+    if verdict is None:
+        logger.info(f"[Amazon.eg] No seller info on {asin} page; skipping.")
+        return False
+    AMAZON_SELLER_CACHE[asin] = verdict
+    if not verdict:
+        logger.info(f"[Amazon.eg] Skipping {asin}: not shipped & sold by Amazon.eg.")
+    return verdict
+
+
 def parse_noon_product_boxes(soup: BeautifulSoup) -> List[DealItem]:
     """
     Parses Noon PLP product cards. Each card is an <a href=".../<SKU>/p/"> holding
@@ -887,27 +951,32 @@ async def execute_single_cycle(browser, db: DealDatabase, cycle_idx: int) -> Tup
     amz_context = await create_stealth_context(browser)
     noon_context = await create_stealth_context(browser)
 
+    sent_count = 0
     try:
         (amz_deals, amz_blocked), (noon_deals, noon_blocked) = await asyncio.gather(
             scrape_amazon_egypt(amz_context, amz_urls),
             scrape_noon_egypt(noon_context, noon_urls),
         )
-    finally:
-        await amz_context.close()
-        await noon_context.close()
 
-    all_deals = amz_deals + noon_deals
-    all_deals.sort(key=lambda d: d.discount_pct, reverse=True)
+        all_deals = amz_deals + noon_deals
+        all_deals.sort(key=lambda d: d.discount_pct, reverse=True)
 
-    sent_count = 0
-    for deal in all_deals:
-        if sent_count >= MAX_ALERTS_PER_RUN:
-            break
-        if db.evaluate_and_record(deal):
+        for deal in all_deals:
+            if sent_count >= MAX_ALERTS_PER_RUN:
+                break
+            if not db.evaluate_and_record(deal):
+                continue
+            # Seller check runs only for deals about to be alerted, keeping extra page loads low
+            if deal.platform == "Amazon Egypt" and AMAZON_SOLD_BY_AMAZON_ONLY:
+                if not await verify_amazon_seller(amz_context, deal):
+                    continue
             if send_telegram_alert(deal):
                 db.mark_notified(deal.product_id, deal.current_price)
                 sent_count += 1
                 await asyncio.sleep(1.3)
+    finally:
+        await amz_context.close()
+        await noon_context.close()
 
     any_blocked = amz_blocked or noon_blocked
     return len(all_deals), sent_count, any_blocked
@@ -991,6 +1060,24 @@ def run_self_test() -> None:
     c0 = select_cycle_urls(AMAZON_EG_DEAL_URLS, 0, 2)
     c1 = select_cycle_urls(AMAZON_EG_DEAL_URLS, 1, 2)
     assert len(c0) == 2 and len(c1) == 2 and c0 != c1, "URL sharding rotation failed"
+
+    # Verify Amazon.eg seller filter URL and buy box seller detection (markup from amazon.eg, Nov 2026)
+    assert all(f"p_6:{AMAZON_EG_SELLER_ID}" in urllib.parse.unquote(u) for u in AMAZON_EG_DEAL_URLS), "Seller filter missing"
+    sold_by_amazon = """
+    <div offer-display-feature-name="desktop-merchant-info" class="offer-display-feature-label"><span>Shipper / Seller</span></div>
+    <div offer-display-feature-name="desktop-merchant-info" class="offer-display-feature-text">
+      <span class="a-size-small offer-display-feature-text-message">Amazon.eg</span></div>
+    """
+    third_party_fba = """
+    <div offer-display-feature-name="desktop-fulfiller-info" class="offer-display-feature-text">
+      <span class="a-size-small offer-display-feature-text-message">Amazon</span></div>
+    <div offer-display-feature-name="desktop-merchant-info" class="offer-display-feature-label"><span>Sold by</span></div>
+    <div offer-display-feature-name="desktop-merchant-info" class="offer-display-feature-text">
+      <a id="sellerProfileTriggerId" class="a-link-normal offer-display-feature-text-message">فرندز</a></div>
+    """
+    assert amazon_buybox_sold_by_amazon(sold_by_amazon) is True, "Amazon.eg-sold offer not recognised"
+    assert amazon_buybox_sold_by_amazon(third_party_fba) is False, "Third-party FBA offer must be rejected"
+    assert amazon_buybox_sold_by_amazon("<html><body>Currently unavailable.</body></html>") is None
 
     # Verify Noon PLP product box parsing (markup captured from noon.com/egypt-en, Nov 2026)
     noon_html = """
