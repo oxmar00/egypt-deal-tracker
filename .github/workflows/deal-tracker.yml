@@ -1,0 +1,75 @@
+name: Egypt Deal Tracker
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour; the script loops for ~52 minutes per run
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "loop = 52-minute scan loop, once = single cycle, self-test = offline test"
+        type: choice
+        options: [loop, once, self-test]
+        default: once
+
+permissions:
+  contents: write   # needed to commit deals_history.db back to the repo
+
+concurrency:
+  group: deal-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PROXY_URLS: ${{ secrets.PROXY_URLS }}
+      AMAZON_PARTNER_TAG: ${{ secrets.AMAZON_PARTNER_TAG }}
+      NOON_AFFILIATE_CODE: ${{ secrets.NOON_AFFILIATE_CODE }}
+      MIN_DISCOUNT_PCT: ${{ vars.MIN_DISCOUNT_PCT || '20.0' }}
+      MAX_PRICE_EGP: ${{ vars.MAX_PRICE_EGP || '0.0' }}
+      MIN_RATING: ${{ vars.MIN_RATING || '3.8' }}
+      MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '15' }}
+      DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Offline self-test
+        run: python deal_tracker.py --self-test
+
+      - name: Run tracker
+        if: ${{ github.event.inputs.mode != 'self-test' }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.mode }}" = "loop" ]; then
+            python deal_tracker.py --loop
+          else
+            python deal_tracker.py
+          fi
+
+      - name: Persist price history
+        if: ${{ always() && github.event.inputs.mode != 'self-test' }}
+        run: |
+          [ -f deals_history.db ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deals_history.db
+          if git diff --cached --quiet; then
+            echo "No DB changes."
+            exit 0
+          fi
+          git commit -m "Update deal price history [skip ci]"
+          git pull --rebase -X theirs || true
+          git push
